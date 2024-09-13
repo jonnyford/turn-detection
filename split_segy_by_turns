@@ -1,0 +1,174 @@
+#!/usr/bin/env python
+
+import argparse
+import numpy as np
+from scipy.ndimage import median_filter, maximum_filter
+from pathlib import Path
+import segyio
+
+def init_argparse():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--critical-turn-radius',
+        help='The turn radius threshold below which we identify a turn (metres)', type=float, default=2000.)
+    parser.add_argument('--minimum-turn-distance',
+        help='The minimum distance which we need to be turning to register a turn (metres)', type=float, default=100.)
+    parser.add_argument('--maximum-trace-separation',
+        help='The maximum distance between traces before we split to a new line even if we are not turning (metres)',
+        type=float, default=100.)
+    parser.add_argument('--minimum_line_length',
+                        help='Lines below this length are merged to avoid short lines (metres)',
+                        type=float, default=500.)
+    parser.add_argument('--trace-skip', help='Check every n-th trace', type=int, default=50)
+    parser.add_argument('--byte_x', help='SEG-Y header byte for x coordinate', type=int, default=73)
+    parser.add_argument('--byte_y', help='SEG-Y header byte for y coordinate', type=int, default=77)
+    parser.add_argument('--byte_coord_scalar', help='SEG-Y header byte for coordinate scalar', type=int, default=71)
+    parser.add_argument('--output',
+        help='Format string for the output filename', type=str, default='{filename}-part-{n:05d}.{ext}')
+    parser.add_argument('--dry-run', help='Output the new line extents only, do not write the files', action='store_true')
+    parser.add_argument('inputs', nargs='+')
+    return parser
+
+def circle_from_3_points(z1: complex, z2: complex, z3: complex) -> tuple[complex, float]:
+    """From three (x, y) points, calculate the centroid and radius of the circle that would intersect all three
+    points.
+
+    From https://math.stackexchange.com/users/740203/scott
+    """
+
+    if (z1 == z2) or (z2 == z3) or (z3 == z1):
+        return np.nan, np.nan
+
+    w = (z3 - z1) / (z2 - z1)
+
+    if abs(w.imag) <= 1e-16: # You should change 0 to a small tolerance for floating point comparisons
+        return np.nan, np.inf
+
+    c = (z2 - z1) * (w - abs(w) ** 2) / (2j * w.imag) + z1  # Simplified denominator
+    r = abs(z1 - c)
+
+    #midpoint = (z3 + z1) / 2
+
+    return c, r
+
+def signed_turning_radius(z1: complex, z2: complex, z3: complex) -> float:
+    """From three time-ordered (x, y) points, calculate the radius of the circle that would intersect all three points.
+    Return the signed radius, where the sign indicates the direction of turning in time (left or right).
+    """
+
+    c, r = circle_from_3_points(z1, z2, z3)
+    sign = (z3.real - z1.real) * (z1.imag - c.imag) - (z1.real - c.real) * (z3.imag - z1.imag)
+    if sign > 0:
+        return r
+    else:
+        return -r
+
+def uniform_filter(a, size):
+    """Running mean over windows of size size."""
+
+    N = size
+    return np.convolve(np.pad(a, (N, N), mode='edge'), np.ones(N) / N, mode='same')[N:-N]
+
+def segment_by_turns(points, critical_turn_radius, minimum_turn_distance, new_line_threshold, n):
+    """
+    :param points: list of complex (x + iy) points
+    :param critical_turn_radius: The threshold below which we identify a turn (m)
+    :param minimum_turn_distance: The minimum distance which we need to be turning to register a turn (m)
+    :param new_line_threshold: The maximum distance between traces before we split to a new line regardless of whether we are turning (m)
+    :param n: Check every d-th trace
+    :return: (lines, lines_length): (i_start, i_end), length of lines
+    """
+
+    d_z = np.sqrt(np.square(np.diff(points.real, append=points[-1].real)) + \
+                  np.square(np.diff(points.imag, append=points[-1].imag)))
+
+    r = [signed_turning_radius(points[i - n], points[i], points[i + n]) for i in range(n, points.shape[0] - n)]
+    r = np.pad(r, (n, n), mode='constant', constant_values=np.inf)
+
+    i = np.arange(r.size)
+    r = np.interp(i, i[np.isfinite(r)], r[np.isfinite(r)])
+    r = median_filter(r, 5)
+
+    N = int(minimum_turn_distance // d_z.mean())
+
+    r_max = maximum_filter(abs(r), N)
+    ind = r_max <= critical_turn_radius
+    ind[0] = False
+    ind[-1] = False
+
+    ind[d_z > new_line_threshold] = True
+    temp = np.diff(ind.astype(int))
+    start_turn, end_turn = np.argwhere(temp > 0), np.argwhere(temp < 0)
+    assert start_turn.size == end_turn.size
+
+    mid_turn = ((start_turn + end_turn) / 2)[:, 0].astype(int)
+    #turn_length = np.array([d_z[int(i[0]):int(j[0])].sum() for i, j in zip(start_turn, end_turn)])
+
+    lines = []
+    i = 0
+
+    for j in mid_turn:
+        lines.append((int(i), int(j - 1)))
+        i = j
+    lines.append((int(i), points.shape[0] - 1))
+    lines_length = [d_z[i:j].sum() for i, j in lines]
+
+    return lines, lines_length
+
+if __name__ == '__main__':
+    parser = init_argparse()
+    args = parser.parse_args()
+
+    for input in args.inputs:
+        path = Path(input)
+
+        with segyio.open(input) as src:
+            spec = segyio.spec()
+            spec.samples = src.samples
+            spec.format = src.format
+            spec.sorting = src.sorting
+
+            coords = np.array([x[args.byte_x] + 1j * x[args.byte_y] for x in src.header])
+            scalar = np.array([x[args.byte_coord_scalar] for x in src.header])
+
+            ind = scalar < 0
+            coords[ind] = coords[ind] / np.abs(scalar[ind])
+            coords[~ind] = coords[~ind] * scalar[~ind]
+
+            lines, lines_length = segment_by_turns(
+                coords,
+                args.critical_turn_radius,
+                args.minimum_turn_distance,
+                args.maximum_trace_separation,
+                args.trace_skip
+            )
+
+            while len(lines) > 1 and min(lines_length) < args.minimum_line_length:
+                i = np.argmin(lines_length)
+                if i > 0:
+                    lines[i - 1] = (lines[i - 1][0], lines[i][1])
+                    lines_length[i - 1] = lines_length[i - 1] + lines_length[i]
+                    del lines[i]
+                    del lines_length[i]
+                else:
+                    lines[i] = (lines[i][0], lines[i + 1][1])
+                    lines_length[i] = lines_length[i] + lines_length[i + 1]
+                    del lines[i + 1]
+                    del lines_length[i + 1]
+
+            total_traces = 0
+
+            for n, (line, length) in enumerate(zip(lines, lines_length)):
+                out_path = Path(args.output.format(filename=path.stem, ext=path.suffix[1:], n=n))
+                n_traces = line[1] - line[0] + 1
+                total_traces += n_traces
+                message = f'{out_path}: traces {line[0]}-{line[1]} ({n_traces} traces or {length:.3g} m)'
+                print(message)
+                if not args.dry_run:
+                    spec.tracecount = n_traces
+                    with segyio.create(out_path, spec) as dst:
+                        dst.text[0] = src.text[0]
+                        dst.bin = src.bin
+                        dst.header = src.header[line[0]:line[1] + 1]
+                        dst.trace = src.trace[line[0]:line[1] + 1]
+
+            assert total_traces == coords.shape[0]
