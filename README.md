@@ -10,12 +10,13 @@ Trace headers and samples in the output files are preserved.
 1. Clone the repo
    ```sh
    git clone https://github.com/jonnyford/turn-detection
+   cd turn-detection
    ```
 2. Install Python dependencies
    ```sh
-   pip install -f requirements.txt
+   pip install -r requirements.txt
    ```
-3. Make script executable
+3. Make script executable (probably not necessary)
    ```sh
    chmod +x split_segy_by_turns
    ```
