@@ -24,7 +24,12 @@ def init_argparse():
     parser.add_argument('--byte_coord_scalar', help='SEG-Y header byte for coordinate scalar', type=int, default=71)
     parser.add_argument('--output',
         help='Format string for the output filename', type=str, default='{filename}-part-{n:05d}.{ext}')
-    parser.add_argument('--dry-run', help='Output the new line extents only, do not write the files', action='store_true')
+    parser.add_argument('--dry-run', help='Output the new line extents only, do not write the files',
+                        action='store_true')
+    parser.add_argument('--dump-headers', help='Dump all incoming and outgoing headers to text files',
+                        action='store_true')
+    parser.add_argument('--dump-navigation', help='Dump incoming and outgoing coordinate headers to text files',
+                        action='store_true')
     parser.add_argument('inputs', nargs='+')
     return parser
 
@@ -121,11 +126,10 @@ if __name__ == '__main__':
     for input in args.inputs:
         path = Path(input)
 
-        with segyio.open(input, mode='r', strict=False) as src:
+        with segyio.open(input, mode='r', strict=False, ignore_geometry=True) as src:
             spec = segyio.spec()
             spec.samples = src.samples
             spec.format = src.format
-            spec.sorting = src.sorting
 
             coords = np.array([x[args.byte_x] + 1j * x[args.byte_y] for x in src.header])
             scalar = np.array([x[args.byte_coord_scalar] for x in src.header])
@@ -133,6 +137,19 @@ if __name__ == '__main__':
             ind = scalar < 0
             coords[ind] = coords[ind] / np.abs(scalar[ind])
             coords[~ind] = coords[~ind] * scalar[~ind]
+
+            if args.dump_navigation and not args.dry_run:
+                navigation_debug = Path('_nav_' + path.stem + '.txt')
+                np.savetxt(navigation_debug,
+                           np.concatenate((coords.real[:, np.newaxis], coords.imag[:, np.newaxis]), axis=1),
+                           fmt='%.1f', delimiter=',', header='x,y', comments='')
+
+            if args.dump_headers:
+                headers = np.array([list(x[segyio.tracefield.keys.values()].values()) for x in src.header])
+                headers_debug = Path('_headers_' + path.stem + '.txt')
+                np.savetxt(headers_debug,
+                           headers,
+                           fmt='%d', delimiter=',', header=','.join(segyio.tracefield.keys.keys()), comments='')
 
             lines, lines_length = segment_by_turns(
                 coords,
@@ -159,11 +176,26 @@ if __name__ == '__main__':
 
             for n, (line, length) in enumerate(zip(lines, lines_length)):
                 out_path = Path(args.output.format(filename=path.stem, ext=path.suffix[1:], n=n))
+
                 n_traces = line[1] - line[0] + 1
                 total_traces += n_traces
                 message = f'{out_path}: traces {line[0]}-{line[1]} ({n_traces} traces or {length:.3g} m)'
                 print(message)
                 if not args.dry_run:
+                    if args.dump_navigation:
+                        navigation_debug = Path('_nav_' + out_path.stem + '.txt')
+                        np.savetxt(navigation_debug,
+                                   np.concatenate((coords[line[0]:line[1] + 1].real[:, np.newaxis],
+                                                   coords[line[0]:line[1] + 1].imag[:, np.newaxis]), axis=1),
+                                   fmt='%.1f', delimiter=',', header=('x,y'), comments='')
+
+                    if args.dump_headers:
+                        headers = np.array([list(x[segyio.tracefield.keys.values()].values()) for x in src.header[line[0]:line[1] + 1]])
+                        headers_debug = Path('_headers_' + out_path.stem + '.txt')
+                        np.savetxt(headers_debug,
+                                   headers,
+                                   fmt='%d', delimiter=',', header=','.join(segyio.tracefield.keys.keys()), comments='')
+
                     spec.tracecount = n_traces
                     with segyio.create(out_path, spec) as dst:
                         dst.text[0] = src.text[0]
