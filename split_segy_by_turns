@@ -121,7 +121,7 @@ if __name__ == '__main__':
     for input in args.inputs:
         path = Path(input)
 
-        with segyio.open(input) as src:
+        with segyio.open(input, mode='r', strict=False) as src:
             spec = segyio.spec()
             spec.samples = src.samples
             spec.format = src.format
