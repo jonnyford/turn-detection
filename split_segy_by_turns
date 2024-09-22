@@ -15,7 +15,7 @@ def init_argparse():
     parser.add_argument('--maximum-trace-separation',
         help='The maximum distance between traces before we split to a new line even if we are not turning (metres)',
         type=float, default=100.)
-    parser.add_argument('--minimum_line_length',
+    parser.add_argument('--minimum-line-length',
                         help='Lines below this length are merged to avoid short lines (metres)',
                         type=float, default=500.)
     parser.add_argument('--trace-skip', help='Check every n-th trace', type=int, default=50)
